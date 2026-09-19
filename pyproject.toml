@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-commit-picker"
+version = "0.1.0"
+description = "Select Git changes, generate a commit message with Codex, and commit locally."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "prompt-toolkit>=3.0,<4",
+]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Version Control :: Git",
+]
+
+[project.urls]
+Repository = "https://github.com/jpaniagua-dev/ai-commit-picker"
+
+[project.scripts]
+ai-commit-picker = "ai_commit_picker:main"
+
+[tool.setuptools]
+py-modules = ["ai_commit_picker"]

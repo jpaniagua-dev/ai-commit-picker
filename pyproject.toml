@@ -13,7 +13,6 @@ dependencies = [
     "prompt-toolkit>=3.0,<4",
 ]
 classifiers = [
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Topic :: Software Development :: Version Control :: Git",
 ]

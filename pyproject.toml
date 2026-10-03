@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-commit-picker"
-version = "0.2.0"
-description = "Select Git changes, generate a commit message with Codex or Claude Code, and commit locally."
+version = "0.3.0"
+description = "Select Git changes, generate a commit message with a configurable provider, and commit locally."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 dependencies = [
     "prompt-toolkit>=3.0,<4",
+    "tomli>=2.0; python_version < '3.11'",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",

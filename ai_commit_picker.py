@@ -1,8 +1,17 @@
 #!/usr/bin/env python
 import argparse
+from dataclasses import dataclass
+import os
+from pathlib import Path
+import re
 import sys
 import subprocess
 import tempfile
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.data_structures import Point
@@ -22,7 +31,7 @@ CATEGORY_ORDER = [
 ]
 
 
-AGENT_PROMPT = """\
+PROVIDER_PROMPT = """\
 Write a git commit message for the currently staged files.
 
 Use the recent commits to learn the project's style, then use the staged diff to describe only the
@@ -43,14 +52,28 @@ CODEX_MODEL = 'gpt-5.6-terra'
 CODEX_REASONING_EFFORT = 'low'
 CLAUDE_MODEL = 'sonnet'
 CLAUDE_REASONING_EFFORT = 'low'
-AGENT_LABELS = {
-    'codex': 'Codex',
-    'claude': 'Claude Code',
-}
-COAUTHOR_FOOTERS = {
-    'codex': 'Co-Authored-By: Codex <noreply@openai.com>',
-    'claude': 'Co-Authored-By: Claude <noreply@anthropic.com>',
-}
+DEFAULT_PROVIDER = 'codex'
+DEFAULT_PROVIDER_TIMEOUT = 120
+PROVIDER_ID_PATTERN = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
+PROVIDER_CONFIG_FIELDS = {'label', 'command', 'footer', 'model', 'effort', 'timeout'}
+ROOT_CONFIG_FIELDS = {'default_provider', 'providers'}
+
+
+@dataclass(frozen=True)
+class Provider:
+    """A commit-message provider using the stdin/stdout command contract."""
+
+    id: str
+    label: str
+    command: tuple[str, ...]
+    footer: str | None = None
+    model: str | None = None
+    effort: str | None = None
+    timeout: int = DEFAULT_PROVIDER_TIMEOUT
+
+
+class ProviderConfigError(ValueError):
+    """Raised when the provider configuration is invalid."""
 
 
 TUI_STYLE = Style.from_dict({
@@ -130,9 +153,10 @@ def order_files(files):
 class FilePicker:
     """Multi-select TUI: checkboxes over `git status` files, Enter to confirm."""
 
-    def __init__(self, files, agent='codex'):
+    def __init__(self, files, providers, provider=DEFAULT_PROVIDER):
         self.files = files
-        self.agent = agent
+        self.providers = providers
+        self.provider = provider
         self.rows = order_files(files)
         self.file_positions = [i for i, r in enumerate(self.rows) if r['type'] == 'file']
         self.cursor = 0
@@ -141,7 +165,7 @@ class FilePicker:
 
     def _render(self):
         fragments = [
-            ('class:title', f" AI Commit Picker · Agent: {AGENT_LABELS[self.agent]} "),
+            ('class:title', f" AI Commit Picker · Provider: {self.providers[self.provider].label} "),
             ('', '\n\n'),
         ]
         line_count = 2  # title + blank line
@@ -180,7 +204,7 @@ class FilePicker:
         fragments.append(('class:count', f"  {checked_count} selected"))
         fragments.append((
             'class:hint',
-            "\n  space: toggle   a: toggle all   t: switch agent   enter: commit   q/esc: cancel\n",
+            "\n  space: toggle   a: toggle all   t: next provider   enter: commit   q/esc: cancel\n",
         ))
         return FormattedText(fragments)
 
@@ -195,8 +219,10 @@ class FilePicker:
         for f in self.files:
             f['checked'] = any_unchecked
 
-    def _toggle_agent(self):
-        self.agent = 'claude' if self.agent == 'codex' else 'codex'
+    def _cycle_provider(self):
+        provider_ids = tuple(self.providers)
+        current_index = provider_ids.index(self.provider)
+        self.provider = provider_ids[(current_index + 1) % len(provider_ids)]
 
     def run(self):
         kb = KeyBindings()
@@ -234,7 +260,7 @@ class FilePicker:
 
         @kb.add('t')
         def _(event):
-            self._toggle_agent()
+            self._cycle_provider()
 
         @kb.add('enter')
         def _(event):
@@ -308,10 +334,10 @@ def read_git_context():
     )
 
 
-def agent_input(git_context):
+def provider_input(git_context):
     """Wrap repository output as clearly delimited, untrusted context."""
     return (
-        f"{AGENT_PROMPT}\n\n"
+        f"{PROVIDER_PROMPT}\n\n"
         "--- BEGIN UNTRUSTED GIT CONTEXT ---\n"
         f"{git_context}\n"
         "--- END UNTRUSTED GIT CONTEXT ---\n"
@@ -353,57 +379,174 @@ def claude_command():
     ]
 
 
-def command_for_agent(agent):
-    """Return the command for a supported agent."""
-    if agent == 'codex':
-        return codex_command()
-    if agent == 'claude':
-        return claude_command()
-    raise ValueError(f"Unsupported agent: {agent}")
+def builtin_providers():
+    """Return the safe provider profiles shipped with the application."""
+    return {
+        'codex': Provider(
+            id='codex',
+            label='Codex',
+            command=tuple(codex_command()),
+            footer='Co-Authored-By: Codex <noreply@openai.com>',
+            model=CODEX_MODEL,
+            effort=CODEX_REASONING_EFFORT,
+        ),
+        'claude': Provider(
+            id='claude',
+            label='Claude Code',
+            command=tuple(claude_command()),
+            footer='Co-Authored-By: Claude <noreply@anthropic.com>',
+            model=CLAUDE_MODEL,
+            effort=CLAUDE_REASONING_EFFORT,
+        ),
+    }
 
 
-def model_for_agent(agent):
-    """Return the configured model and reasoning effort for display."""
-    if agent == 'codex':
-        return CODEX_MODEL, CODEX_REASONING_EFFORT
-    if agent == 'claude':
-        return CLAUDE_MODEL, CLAUDE_REASONING_EFFORT
-    raise ValueError(f"Unsupported agent: {agent}")
+def default_config_path():
+    """Return the platform-specific provider configuration path."""
+    configured_path = os.environ.get('AI_COMMIT_PICKER_CONFIG')
+    if configured_path:
+        return Path(configured_path).expanduser()
+    if sys.platform == 'win32' and os.environ.get('APPDATA'):
+        config_root = Path(os.environ['APPDATA'])
+    else:
+        config_root = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config'))
+    return config_root / 'ai-commit-picker' / 'config.toml'
 
 
-def generate_commit_message(agent, git_context):
-    """Ask the selected agent for a message outside the repository working directory."""
-    command = command_for_agent(agent)
+def _optional_string(provider_id, values, key):
+    value = values.get(key)
+    if value is not None and not isinstance(value, str):
+        raise ProviderConfigError(f"Provider `{provider_id}` field `{key}` must be a string.")
+    return value or None
+
+
+def provider_from_config(provider_id, values):
+    """Validate and build one custom provider from decoded TOML values."""
+    if not PROVIDER_ID_PATTERN.fullmatch(provider_id):
+        raise ProviderConfigError(
+            f"Invalid provider id `{provider_id}`; use letters, numbers, dots, dashes, or underscores."
+        )
+    if not isinstance(values, dict):
+        raise ProviderConfigError(f"Provider `{provider_id}` must be a TOML table.")
+    unknown_fields = set(values) - PROVIDER_CONFIG_FIELDS
+    if unknown_fields:
+        field_list = ', '.join(sorted(unknown_fields))
+        raise ProviderConfigError(f"Provider `{provider_id}` has unknown field(s): {field_list}.")
+
+    label = values.get('label', provider_id)
+    if not isinstance(label, str) or not label.strip():
+        raise ProviderConfigError(f"Provider `{provider_id}` field `label` must be a non-empty string.")
+
+    command = values.get('command')
+    if (
+        not isinstance(command, list)
+        or not command
+        or any(not isinstance(part, str) or not part for part in command)
+    ):
+        raise ProviderConfigError(
+            f"Provider `{provider_id}` field `command` must be a non-empty array of strings."
+        )
+
+    timeout = values.get('timeout', DEFAULT_PROVIDER_TIMEOUT)
+    if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0:
+        raise ProviderConfigError(f"Provider `{provider_id}` field `timeout` must be a positive integer.")
+
+    return Provider(
+        id=provider_id,
+        label=label.strip(),
+        command=tuple(command),
+        footer=_optional_string(provider_id, values, 'footer'),
+        model=_optional_string(provider_id, values, 'model'),
+        effort=_optional_string(provider_id, values, 'effort'),
+        timeout=timeout,
+    )
+
+
+def load_provider_settings(config_path=None):
+    """Merge built-in providers with optional user-defined TOML profiles."""
+    providers = builtin_providers()
+    path = Path(config_path) if config_path else default_config_path()
+    if not path.is_file():
+        return providers, DEFAULT_PROVIDER, path
+
+    try:
+        with path.open('rb') as config_file:
+            values = tomllib.load(config_file)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise ProviderConfigError(f"Could not read provider configuration `{path}`: {error}") from error
+
+    unknown_root_fields = set(values) - ROOT_CONFIG_FIELDS
+    if unknown_root_fields:
+        field_list = ', '.join(sorted(unknown_root_fields))
+        raise ProviderConfigError(f"Unknown configuration field(s): {field_list}.")
+
+    provider_values = values.get('providers', {})
+    if not isinstance(provider_values, dict):
+        raise ProviderConfigError('The `providers` setting must be a TOML table.')
+    for provider_id, provider_config in provider_values.items():
+        if provider_id in providers:
+            raise ProviderConfigError(
+                f"Custom provider `{provider_id}` conflicts with a built-in provider id."
+            )
+        providers[provider_id] = provider_from_config(provider_id, provider_config)
+
+    default_provider = values.get('default_provider', DEFAULT_PROVIDER)
+    if not isinstance(default_provider, str) or default_provider not in providers:
+        raise ProviderConfigError(
+            f"Default provider `{default_provider}` is not defined in the provider registry."
+        )
+    return providers, default_provider, path
+
+
+def describe_provider(provider):
+    """Return optional provider metadata for status output."""
+    details = []
+    if provider.model:
+        details.append(provider.model)
+    if provider.effort:
+        details.append(f"{provider.effort} reasoning")
+    return f" ({', '.join(details)})" if details else ''
+
+
+def generate_commit_message(provider, git_context):
+    """Ask the selected provider for a message outside the repository working directory."""
     with tempfile.TemporaryDirectory(prefix='ai-commit-picker-') as temporary_dir:
         try:
             result = subprocess.run(
-                command,
+                list(provider.command),
                 check=False,
                 cwd=temporary_dir,
-                input=agent_input(git_context),
+                input=provider_input(git_context),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                timeout=provider.timeout,
             )
         except FileNotFoundError:
-            print(f"Error: `{command[0]}` CLI not found in PATH.")
+            print(f"Error: `{provider.command[0]}` CLI not found in PATH.")
+            return None, 1
+        except subprocess.TimeoutExpired:
+            print(f"Error: {provider.label} timed out after {provider.timeout} seconds.")
             return None, 1
 
     if result.returncode != 0:
-        print(f"Error: {AGENT_LABELS[agent]} exited with status {result.returncode}.")
+        print(f"Error: {provider.label} exited with status {result.returncode}.")
         return None, result.returncode
 
     message = result.stdout.strip()
     if not message:
-        print(f"Error: {AGENT_LABELS[agent]} returned an empty commit message.")
+        print(f"Error: {provider.label} returned an empty commit message.")
         return None, 1
 
     return message, 0
 
 
-def create_commit(message, agent):
-    """Create the commit from a validated message and agent-specific footer."""
-    commit_message = f"{message.rstrip()}\n\n{COAUTHOR_FOOTERS[agent]}\n"
+def create_commit(message, provider):
+    """Create the commit from a validated message and optional provider footer."""
+    commit_message = message.rstrip()
+    if provider.footer:
+        commit_message += f"\n\n{provider.footer}"
+    commit_message += '\n'
     result = subprocess.run(
         ['git', 'commit', '-F', '-'],
         input=commit_message,
@@ -413,22 +556,51 @@ def create_commit(message, agent):
     return result.returncode
 
 
-def parse_args(argv=None):
+def config_path_from_args(argv=None):
+    """Read only the config override before loading dynamic provider choices."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument('--config', type=Path)
+    args, _ = parser.parse_known_args(argv)
+    return args.config
+
+
+def parse_args(argv=None, providers=None, default_provider=DEFAULT_PROVIDER):
     """Parse command-line options."""
+    providers = providers or builtin_providers()
     parser = argparse.ArgumentParser(
-        description='Select Git changes and generate a commit message with an AI coding agent.',
+        description='Select Git changes and generate a commit message with a configured provider.',
     )
     parser.add_argument(
-        '--agent',
-        choices=tuple(AGENT_LABELS),
-        default='codex',
-        help='message agent to start with; press t in the picker to switch',
+        '--provider',
+        choices=tuple(providers),
+        default=default_provider,
+        help='message provider to start with; press t in the picker to cycle providers',
+    )
+    parser.add_argument('--config', type=Path, help='path to a provider configuration TOML file')
+    parser.add_argument(
+        '--list-providers',
+        action='store_true',
+        help='list configured providers and exit',
     )
     return parser.parse_args(argv)
 
 
 def main(argv=None):
-    args = parse_args(argv)
+    argv = sys.argv[1:] if argv is None else list(argv)
+    requested_config_path = config_path_from_args(argv)
+    try:
+        providers, default_provider, config_path = load_provider_settings(requested_config_path)
+    except ProviderConfigError as error:
+        print(f"Error: {error}")
+        sys.exit(2)
+    args = parse_args(argv, providers, default_provider)
+
+    if args.list_providers:
+        for provider_id, provider in providers.items():
+            default_marker = ' (default)' if provider_id == default_provider else ''
+            print(f"{provider_id}: {provider.label}{default_marker}")
+        print(f"Configuration: {config_path}")
+        return
 
     print("###########################################")
     print("AI Commit Picker")
@@ -443,7 +615,7 @@ def main(argv=None):
         print("Nothing to commit (working tree clean).")
         return
 
-    picker = FilePicker(files, agent=args.agent)
+    picker = FilePicker(files, providers, provider=args.provider)
     selection = picker.run()
 
     if selection is None:
@@ -460,8 +632,7 @@ def main(argv=None):
         print("Index is empty after sync. Nothing to commit.")
         return
 
-    agent = picker.agent
-    model, effort = model_for_agent(agent)
+    provider = providers[picker.provider]
     try:
         git_context = read_git_context()
     except subprocess.CalledProcessError as error:
@@ -469,15 +640,15 @@ def main(argv=None):
         sys.exit(error.returncode)
 
     print(
-        f"Generating a commit message with {AGENT_LABELS[agent]} "
-        f"({model}, {effort} reasoning)...\n"
+        f"Generating a commit message with {provider.label}"
+        f"{describe_provider(provider)}...\n"
     )
-    message, code = generate_commit_message(agent, git_context)
+    message, code = generate_commit_message(provider, git_context)
     if code != 0:
         sys.exit(code)
 
     print("\nCreating commit...")
-    sys.exit(create_commit(message, agent))
+    sys.exit(create_commit(message, provider))
 
 
 if __name__ == "__main__":
